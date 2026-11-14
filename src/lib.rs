@@ -591,7 +591,10 @@ impl Store {
             ",
         )
         .with_context(|| {
-            format!("create the schema in {}", root.join("records.sqlite3").display())
+            format!(
+                "create the schema in {}",
+                root.join("records.sqlite3").display()
+            )
         })?;
         let device_id = read_or_create_device_id(device_path)?;
         let has_deleted: bool = db.query_row(
@@ -1440,31 +1443,53 @@ fn set_wal(db: &Connection) -> anyhow::Result<()> {
 /// belongs to a device the store has forgotten, which is a sync failure that
 /// looks like data loss. `create_new` makes exactly one process the creator.
 fn read_or_create_device_id(path: &Path) -> anyhow::Result<String> {
-    if let Ok(text) = fs::read_to_string(path) {
-        let id = text.trim().to_string();
-        if !id.is_empty() {
-            return Ok(id);
-        }
+    if let Some(id) = read_device_id(path)? {
+        return Ok(id);
     }
     let id = Uuid::new_v4().to_string();
-    match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
-        Ok(mut file) => {
-            writeln!(file, "{id}")?;
-            Ok(id)
-        }
-        // Someone else won the race; their id is the store's identity.
+    // Publish the id atomically. `create_new` gives exactly one creator, but it
+    // also exposes the file name before the contents: a dozen `mb` invocations
+    // opening a fresh store then read a file that exists and is empty, and most
+    // of them failed on it. Writing a staging file and hard-linking it into
+    // place means the name never exists without its contents — `hard_link` is
+    // atomic and refuses a destination that is already there, so it is also what
+    // picks the single winner.
+    let staging = path.with_extension(format!("staging-{id}"));
+    fs::write(&staging, format!("{id}\n"))?;
+    let linked = fs::hard_link(&staging, path);
+    let _ = fs::remove_file(&staging);
+    match linked {
+        Ok(()) => Ok(id),
+        // Someone else won; their id is the store's identity.
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            let text = fs::read_to_string(path)?;
-            let id = text.trim().to_string();
-            if id.is_empty() {
-                bail!("device id file {} is empty", path.display());
+            match read_device_id(path)? {
+                Some(id) => Ok(id),
+                // An empty file cannot be a real id: it is what the old
+                // non-atomic create left behind when it lost the race, or after
+                // a crash between open and write. Clear it and take the slot.
+                None => {
+                    fs::remove_file(path)?;
+                    let retry = path.with_extension(format!("staging-{id}-b"));
+                    fs::write(&retry, format!("{id}\n"))?;
+                    let linked = fs::hard_link(&retry, path);
+                    let _ = fs::remove_file(&retry);
+                    linked?;
+                    Ok(id)
+                }
             }
-            Ok(id)
         }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The id already on disk, if there is a usable one.
+fn read_device_id(path: &Path) -> anyhow::Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(text) => {
+            let id = text.trim().to_string();
+            Ok((!id.is_empty()).then_some(id))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
 }
@@ -2549,6 +2574,25 @@ mod tests {
         opened.sort();
         opened.dedup();
         assert_eq!(opened.len(), 1, "one store, one device id: {opened:?}");
+    }
+
+    #[test]
+    fn an_empty_device_id_file_is_repaired() {
+        // The old create exposed the file name before its contents, so a reader
+        // could see a device id file that existed and was empty. That cannot be
+        // a real id: it is a leftover, and the store has to take it back rather
+        // than refuse to open forever.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("store");
+        let device = dir.path().join("device");
+        fs::write(&device, "").unwrap();
+        let store = Store::open(&root, &device).unwrap();
+        assert!(!store.device_id.is_empty());
+        assert_eq!(
+            fs::read_to_string(&device).unwrap().trim(),
+            store.device_id,
+            "the file must end up holding the id the store is using"
+        );
     }
 
     #[test]
