@@ -40,6 +40,13 @@ const PUSH_KIND: &str = "records.sync.push.v1";
 const ACK_KIND: &str = "records.sync.ack.v1";
 const ERROR_KIND: &str = "records.sync.error.v1";
 const SYNC_TIMEOUT: Duration = Duration::from_secs(30);
+/// How much of a book one sync frame may carry. The retained permit bounds a
+/// frame (16 MiB by default) and a book's log easily outgrows it, so the page
+/// stays well inside the bound and a catch-up is a sequence of frames instead of
+/// one impossible one.
+const SYNC_PAGE_BYTES: usize = 4 * 1024 * 1024;
+/// A catch-up that never terminates is a protocol bug, not a slow peer.
+const MAX_SYNC_PAGES: usize = 100_000;
 
 #[derive(Parser)]
 #[command(version, about = "Local-first fungOS records")]
@@ -1327,6 +1334,76 @@ impl Store {
         Ok(ops)
     }
 
+    /// One page of the ops a peer is missing, bounded by bytes.
+    ///
+    /// A pull used to answer with every missing op in a single frame, which
+    /// cannot bootstrap a book whose log is larger than the session's payload
+    /// bound — the failure was a send timeout with no hint of the cause. Paging
+    /// is by `(hlc, device_id, seq)` and the cursor is carried explicitly rather
+    /// than inferred from the caller's vector: the vector is one high-water mark
+    /// per device, so resuming from it would skip any gap below that mark if ops
+    /// ever arrived out of order. Within one device `hlc` and `seq` agree, so
+    /// this order never produces such a gap — but the cursor does not depend on
+    /// that being true.
+    ///
+    /// Returns the page, the cursor to resume after, and whether more remain.
+    pub fn dump_page(
+        &self,
+        book: &str,
+        since: Option<&Vector>,
+        after: Option<&OpCursor>,
+        budget: usize,
+    ) -> anyhow::Result<(Vec<Op>, Option<OpCursor>, bool)> {
+        let (sql, params): (&str, Vec<SqlValue>) = match after {
+            Some(cursor) => (
+                "SELECT op_id,book_id,device_id,seq,hlc,kind,entity_id,body
+                 FROM ops WHERE book_id=?1
+                   AND (hlc > ?2
+                        OR (hlc = ?2 AND device_id > ?3)
+                        OR (hlc = ?2 AND device_id = ?3 AND seq > ?4))
+                 ORDER BY hlc, device_id, seq",
+                vec![
+                    SqlValue::Text(book.to_string()),
+                    SqlValue::Integer(cursor.hlc as i64),
+                    SqlValue::Text(cursor.device_id.clone()),
+                    SqlValue::Integer(cursor.seq as i64),
+                ],
+            ),
+            None => (
+                "SELECT op_id,book_id,device_id,seq,hlc,kind,entity_id,body
+                 FROM ops WHERE book_id=?1 ORDER BY hlc, device_id, seq",
+                vec![SqlValue::Text(book.to_string())],
+            ),
+        };
+        let mut statement = self.db.prepare(sql)?;
+        let rows = statement.query_map(params_from_iter(params), row_to_op)?;
+        let mut ops = Vec::new();
+        let mut cursor = None;
+        let mut bytes = 0usize;
+        let mut more = false;
+        for row in rows {
+            let op = row?;
+            if let Some(vector) = since
+                && vector.devices.get(&op.device_id).copied().unwrap_or(0) >= op.seq
+            {
+                continue;
+            }
+            let size = op.body.to_string().len() + 96;
+            if !ops.is_empty() && bytes + size > budget {
+                more = true;
+                break;
+            }
+            bytes += size;
+            cursor = Some(OpCursor {
+                hlc: op.hlc,
+                device_id: op.device_id.clone(),
+                seq: op.seq,
+            });
+            ops.push(op);
+        }
+        Ok((ops, cursor, more))
+    }
+
     pub fn apply_op(&mut self, op: &Op) -> anyhow::Result<()> {
         if op.op_id != op_id(op)? {
             bail!("op id mismatch for {}", op.op_id);
@@ -2005,11 +2082,22 @@ pub struct PeerSyncOutcome {
     pub remote: Vector,
 }
 
+/// Where a page stopped, so the next pull resumes after it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpCursor {
+    hlc: u64,
+    device_id: String,
+    seq: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PullRequest {
     request_id: String,
     book_id: String,
     vector: Vector,
+    /// Resume after this op. Absent starts from the beginning of the log.
+    #[serde(default)]
+    after: Option<OpCursor>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2018,6 +2106,12 @@ pub struct OpsResponse {
     book_id: String,
     ops: Vec<Op>,
     vector: Vector,
+    /// Resume point for the page after this one.
+    #[serde(default)]
+    cursor: Option<OpCursor>,
+    /// Ops remain beyond this page.
+    #[serde(default)]
+    more: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2074,13 +2168,20 @@ fn serve_unibus(store: &mut Store, config: &Path) -> anyhow::Result<()> {
                     eprintln!("records: invalid pull request");
                     continue;
                 };
-                match store.dump(&request.book_id, Some(&request.vector)) {
-                    Ok(ops) => {
+                match store.dump_page(
+                    &request.book_id,
+                    Some(&request.vector),
+                    request.after.as_ref(),
+                    SYNC_PAGE_BYTES,
+                ) {
+                    Ok((ops, cursor, more)) => {
                         let response = OpsResponse {
                             request_id: request.request_id.clone(),
                             book_id: request.book_id.clone(),
                             vector: store.vector(&request.book_id)?,
                             ops,
+                            cursor,
+                            more,
                         };
                         reply(&client, &envelope, OPS_KIND, &response)?;
                     }
@@ -2174,40 +2275,55 @@ fn reply_error(
 
 fn sync_unibus(store: &mut Store, book: &str, config: &Path, peer: &str) -> anyhow::Result<()> {
     let client = load_client(config)?;
-    let request_id = Uuid::new_v4().to_string();
-    let pull = PullRequest {
-        request_id: request_id.clone(),
-        book_id: book.into(),
-        vector: store.vector(book)?,
-    };
-    send_request(&client, peer, PULL_KIND, &pull)?;
-    let response: OpsResponse = wait_for(&client, OPS_KIND, &request_id)?;
-    if response.book_id != book {
-        bail!("peer answered for {}", response.book_id);
-    }
     let mut pulled = 0;
-    for op in &response.ops {
-        store.apply_op(op)?;
-        pulled += 1;
+    let mut after: Option<OpCursor> = None;
+    let mut remote = store.vector(book)?;
+    for _ in 0..MAX_SYNC_PAGES {
+        let request_id = Uuid::new_v4().to_string();
+        let pull = PullRequest {
+            request_id: request_id.clone(),
+            book_id: book.into(),
+            vector: store.vector(book)?,
+            after: after.clone(),
+        };
+        send_request(&client, peer, PULL_KIND, &pull)?;
+        let response: OpsResponse = wait_for(&client, OPS_KIND, &request_id)?;
+        if response.book_id != book {
+            bail!("peer answered for {}", response.book_id);
+        }
+        remote = response.vector;
+        for op in &response.ops {
+            store.apply_op(op)?;
+            pulled += 1;
+        }
+        if !response.more {
+            break;
+        }
+        match response.cursor {
+            Some(cursor) => after = Some(cursor),
+            None => break,
+        }
     }
-    let push_ops = store.dump(book, Some(&response.vector))?;
-    let pushed = push_ops.len();
-    if !push_ops.is_empty() {
+    let push_ops = store.dump(book, Some(&remote))?;
+    let mut pushed = 0;
+    for chunk in push_ops.chunks(push_chunk_len(&push_ops)) {
+        let request_id = Uuid::new_v4().to_string();
         let push = PushRequest {
             request_id: request_id.clone(),
             book_id: book.into(),
-            ops: push_ops,
+            ops: chunk.to_vec(),
         };
         send_request(&client, peer, PUSH_KIND, &push)?;
         let ack: AckResponse = wait_for(&client, ACK_KIND, &request_id)?;
         if ack.book_id != book {
             bail!("peer acknowledged {}", ack.book_id);
         }
+        pushed += chunk.len();
     }
     println!(
         "unibus sync {book}: pulled {pulled}, pushed {pushed} (local {} remote {})",
         vector_string(&store.vector(book)?),
-        vector_string(&response.vector)
+        vector_string(&remote)
     );
     Ok(())
 }
@@ -2259,12 +2375,19 @@ pub async fn handle_peer_frame(
                 else {
                     return Ok(true);
                 };
-                let response = match store.dump(&request.book_id, Some(&request.vector)) {
-                    Ok(ops) => OpsResponse {
+                let response = match store.dump_page(
+                    &request.book_id,
+                    Some(&request.vector),
+                    request.after.as_ref(),
+                    SYNC_PAGE_BYTES,
+                ) {
+                    Ok((ops, cursor, more)) => OpsResponse {
                         request_id: request.request_id.clone(),
                         book_id: request.book_id.clone(),
                         vector: store.vector(&request.book_id)?,
                         ops,
+                        cursor,
+                        more,
                     },
                     Err(error) => {
                         reply_peer_error(
@@ -2338,25 +2461,45 @@ pub async fn sync_peer_session(
     book: &str,
     endpoint: &PeerEndpoint,
 ) -> anyhow::Result<PeerSyncOutcome> {
-    let request_id = Uuid::new_v4().to_string();
-    let pull = PullRequest {
-        request_id: request_id.clone(),
-        book_id: book.into(),
-        vector: store.vector(book)?,
-    };
-    send_peer(session, endpoint, PULL_KIND, &pull).await?;
-    let response: OpsResponse = wait_peer(session, OPS_KIND, &request_id).await?;
-    if response.book_id != book {
-        bail!("peer answered for {}", response.book_id);
-    }
+    // Pull in pages until the peer has nothing left. A book taller than one
+    // frame used to be unsyncable; now the page size decides how many round
+    // trips a catch-up costs, not whether it is possible.
     let mut pulled = 0;
-    for op in &response.ops {
-        store.apply_op(op)?;
-        pulled += 1;
+    let mut after: Option<OpCursor> = None;
+    let mut remote = store.vector(book)?;
+    for _ in 0..MAX_SYNC_PAGES {
+        let request_id = Uuid::new_v4().to_string();
+        let pull = PullRequest {
+            request_id: request_id.clone(),
+            book_id: book.into(),
+            vector: store.vector(book)?,
+            after: after.clone(),
+        };
+        send_peer(session, endpoint, PULL_KIND, &pull).await?;
+        let response: OpsResponse = wait_peer(session, OPS_KIND, &request_id).await?;
+        if response.book_id != book {
+            bail!("peer answered for {}", response.book_id);
+        }
+        remote = response.vector;
+        for op in &response.ops {
+            store.apply_op(op)?;
+            pulled += 1;
+        }
+        if !response.more {
+            break;
+        }
+        match response.cursor {
+            Some(cursor) => after = Some(cursor),
+            // "More" with no cursor cannot advance; stop rather than spin.
+            None => break,
+        }
     }
-    let push_ops = store.dump(book, Some(&response.vector))?;
-    let pushed = push_ops.len();
-    if !push_ops.is_empty() {
+
+    // Push the same way: a backlog larger than a frame goes in several.
+    let push_ops = store.dump(book, Some(&remote))?;
+    let mut pushed = 0;
+    for chunk in push_ops.chunks(push_chunk_len(&push_ops)) {
+        let request_id = Uuid::new_v4().to_string();
         send_peer(
             session,
             endpoint,
@@ -2364,7 +2507,7 @@ pub async fn sync_peer_session(
             &PushRequest {
                 request_id: request_id.clone(),
                 book_id: book.into(),
-                ops: push_ops,
+                ops: chunk.to_vec(),
             },
         )
         .await?;
@@ -2372,13 +2515,30 @@ pub async fn sync_peer_session(
         if ack.book_id != book {
             bail!("peer acknowledged {}", ack.book_id);
         }
+        pushed += chunk.len();
     }
+
     Ok(PeerSyncOutcome {
         pulled,
         pushed,
         local: store.vector(book)?,
-        remote: response.vector,
+        remote,
     })
+}
+
+/// How many ops of this set fit in one push frame.
+///
+/// Sized by body, because a frame's cost is the bodies plus a fixed header per
+/// op, and the permit bounds bytes rather than counts.
+fn push_chunk_len(ops: &[Op]) -> usize {
+    let mut bytes = 0usize;
+    for (index, op) in ops.iter().enumerate() {
+        bytes += op.body.to_string().len() + 96;
+        if bytes > SYNC_PAGE_BYTES && index > 0 {
+            return index;
+        }
+    }
+    ops.len().max(1)
 }
 
 async fn send_peer<T: Serialize>(
@@ -2574,6 +2734,94 @@ mod tests {
         opened.sort();
         opened.dedup();
         assert_eq!(opened.len(), 1, "one store, one device id: {opened:?}");
+    }
+
+    #[test]
+    fn a_book_larger_than_one_page_still_transfers_completely() {
+        // The unit of a catch-up is a page, not a frame. Walk the same paging
+        // loop the sync path uses, with a deliberately tiny budget, and check
+        // the receiver ends up with every op exactly once and the vectors agree.
+        let dir = tempfile::tempdir().unwrap();
+        let mut source =
+            Store::open(&dir.path().join("source"), &dir.path().join("dev-src")).unwrap();
+        let book = "personal/test/book";
+        let written = 40;
+        for n in 0..written {
+            source
+                .put_record(
+                    book,
+                    &format!("item-{n}"),
+                    "test.item@1",
+                    1,
+                    serde_json::json!({ "n": n, "padding": "x".repeat(200) }),
+                )
+                .unwrap();
+        }
+        let mut peer = Store::open(&dir.path().join("peer"), &dir.path().join("dev-peer")).unwrap();
+
+        // Same order and same skip rule the responder uses, one page at a time.
+        let mut after: Option<OpCursor> = None;
+        let mut pages = 0;
+        loop {
+            let (ops, cursor, more) = source
+                .dump_page(book, Some(&peer.vector(book).unwrap()), after.as_ref(), 700)
+                .unwrap();
+            for op in &ops {
+                peer.apply_op(op).unwrap();
+            }
+            pages += 1;
+            if !more {
+                break;
+            }
+            after = cursor;
+            assert!(pages < 1_000, "paging did not terminate");
+        }
+
+        assert!(pages > 1, "the budget should have forced several pages");
+        assert_eq!(peer.dump(book, None).unwrap().len(), written);
+        assert_eq!(
+            source.vector(book).unwrap().devices,
+            peer.vector(book).unwrap().devices,
+            "vectors converge when the whole log has arrived"
+        );
+    }
+
+    #[test]
+    fn a_resumed_page_never_skips_an_op_it_did_not_send() {
+        // Paging resumes from the last op sent, not from the receiver's
+        // vector: the vector is one high-water mark per device, so a gap below
+        // it would be silently skipped.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("a"), &dir.path().join("dev-a")).unwrap();
+        let book = "personal/test/book";
+        for n in 0..10 {
+            store
+                .put_record(
+                    book,
+                    &format!("item-{n}"),
+                    "test.item@1",
+                    1,
+                    serde_json::json!({ "n": n, "padding": "x".repeat(200) }),
+                )
+                .unwrap();
+        }
+        let all = store.dump(book, None).unwrap();
+        let (first, cursor, more) = store.dump_page(book, None, None, 700).unwrap();
+        assert!(more, "the budget should not have covered the whole log");
+        let mut seen: Vec<String> = first.iter().map(|op| op.op_id.clone()).collect();
+        let mut after = cursor;
+        loop {
+            let (page, cursor, more) = store.dump_page(book, None, after.as_ref(), 700).unwrap();
+            seen.extend(page.iter().map(|op| op.op_id.clone()));
+            if !more {
+                break;
+            }
+            after = cursor;
+        }
+        assert_eq!(seen.len(), all.len(), "no op is sent twice or skipped");
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), all.len());
     }
 
     #[test]
