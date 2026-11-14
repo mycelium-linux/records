@@ -40,11 +40,15 @@ const PUSH_KIND: &str = "records.sync.push.v1";
 const ACK_KIND: &str = "records.sync.ack.v1";
 const ERROR_KIND: &str = "records.sync.error.v1";
 const SYNC_TIMEOUT: Duration = Duration::from_secs(30);
-/// How much of a book one sync frame may carry. The retained permit bounds a
-/// frame (16 MiB by default) and a book's log easily outgrows it, so the page
-/// stays well inside the bound and a catch-up is a sequence of frames instead of
-/// one impossible one.
-const SYNC_PAGE_BYTES: usize = 4 * 1024 * 1024;
+/// How much of a book one sync frame may carry.
+///
+/// Deliberately far below both bounds that apply — the retained permit (16 MiB)
+/// and `unibus`'s `MAX_FRAME` (also 16 MiB) — because a frame near the bound does
+/// not fail cleanly: the send is torn down as "connection lost" and the receiver
+/// reports a receive timeout, which reads like a broken session rather than an
+/// oversized message. 256 KiB keeps a page comfortably inside both, and the cost
+/// of the extra round trips is exactly what paging exists to pay.
+const SYNC_PAGE_BYTES: usize = 256 * 1024;
 /// A catch-up that never terminates is a protocol bug, not a slow peer.
 const MAX_SYNC_PAGES: usize = 100_000;
 
