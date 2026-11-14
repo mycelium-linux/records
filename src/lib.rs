@@ -540,10 +540,15 @@ impl Store {
         fs::create_dir_all(root)?;
         fs::create_dir_all(root.join("keys"))?;
         let db = Connection::open(root.join("records.sqlite3"))?;
+        // The timeout goes on first. Every statement below may need the write
+        // lock, and a fresh connection waits for none of them: with the pragma
+        // batch below, the journal-mode switch ran before `busy_timeout` and a
+        // second process opening the store got `database is locked` instead of
+        // waiting its turn.
+        db.busy_timeout(Duration::from_millis(5000))?;
+        set_wal(&db)?;
         db.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA busy_timeout=5000;
-             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS ops(
                op_id TEXT PRIMARY KEY,
                book_id TEXT NOT NULL,
@@ -584,14 +589,11 @@ impl Store {
              );
              CREATE INDEX IF NOT EXISTS outbox_due ON outbox(book_id, peer_id, next_attempt_hlc);
             ",
-        )?;
-        let device_id = if device_path.exists() {
-            fs::read_to_string(device_path)?.trim().to_string()
-        } else {
-            let id = Uuid::new_v4().to_string();
-            fs::write(device_path, format!("{id}\n"))?;
-            id
-        };
+        )
+        .with_context(|| {
+            format!("create the schema in {}", root.join("records.sqlite3").display())
+        })?;
+        let device_id = read_or_create_device_id(device_path)?;
         let has_deleted: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('records') WHERE name='deleted')",
             [],
@@ -729,15 +731,7 @@ impl Store {
     }
 
     fn next_seq_for(&self, book: &str, device_id: &str) -> anyhow::Result<u64> {
-        let current: Option<i64> = self
-            .db
-            .query_row(
-                "SELECT seq FROM ops WHERE book_id=?1 AND device_id=?2 ORDER BY seq DESC LIMIT 1",
-                params![book, device_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(current.unwrap_or(0) as u64 + 1)
+        next_seq_on(&self.db, book, device_id)
     }
 
     pub fn append(
@@ -800,7 +794,17 @@ impl Store {
         body: serde_json::Value,
         hlc: u64,
     ) -> anyhow::Result<Op> {
-        let seq = self.next_seq_for(book, device_id)?;
+        // The sequence is allocated *inside* the write transaction. Reading
+        // `MAX(seq)+1` outside one gives two writers the same number, and the
+        // loser then collides with `UNIQUE(book_id, device_id, seq)` — which
+        // poisons that device's sequence for the book rather than costing one
+        // retry, because the op that failed can never be applied by a peer
+        // either. `BEGIN IMMEDIATE` takes SQLite's write lock before the read,
+        // and `busy_timeout` makes the other writer wait instead of failing.
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let seq = next_seq_on(&tx, book, device_id)?;
         let mut op = Op {
             op_id: String::new(),
             book_id: book.into(),
@@ -812,7 +816,6 @@ impl Store {
             body,
         };
         op.op_id = op_id(&op)?;
-        let tx = self.db.unchecked_transaction()?;
         apply_projection(&tx, &op)?;
         let body = serde_json::to_string(&op.body)?;
         tx.execute(
@@ -1325,18 +1328,18 @@ impl Store {
         if op.op_id != op_id(op)? {
             bail!("op id mismatch for {}", op.op_id);
         }
-        let exists: bool = self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM ops WHERE op_id=?1)",
-            params![op.op_id],
-            |row| row.get(0),
-        )?;
-        if exists {
-            return Ok(());
-        }
-        apply_projection(&self.db, op)?;
+        // Application has to be idempotent *and* concurrent-safe: two hosts
+        // syncing the same book at once both decide an op is new, and the second
+        // insert used to fail on `UNIQUE(book_id, device_id, seq)` — turning a
+        // re-delivery, which the protocol promises is harmless, into an error.
+        // `INSERT OR IGNORE` inside one transaction makes exactly one applier
+        // win; the loser writes nothing.
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let body = serde_json::to_string(&op.body)?;
-        self.db.execute(
-            "INSERT INTO ops(op_id,book_id,device_id,seq,hlc,kind,entity_id,body)
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO ops(op_id,book_id,device_id,seq,hlc,kind,entity_id,body)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
             params![
                 op.op_id,
@@ -1349,6 +1352,35 @@ impl Store {
                 body
             ],
         )?;
+        if inserted == 0 {
+            // Either this op is already here, or a different op of the same
+            // device claims this sequence. The first is re-delivery; the second
+            // is a corrupt store, and silently dropping the op would hide it.
+            let known: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM ops WHERE op_id=?1)",
+                params![op.op_id],
+                |row| row.get(0),
+            )?;
+            if known {
+                return Ok(());
+            }
+            let holder: Option<String> = tx
+                .query_row(
+                    "SELECT op_id FROM ops WHERE book_id=?1 AND device_id=?2 AND seq=?3",
+                    params![op.book_id, op.device_id, op.seq as i64],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            bail!(
+                "{} already holds sequence {} for {} on device {}: two ops claimed one number",
+                holder.as_deref().unwrap_or("<unknown>"),
+                op.seq,
+                op.book_id,
+                op.device_id
+            );
+        }
+        apply_projection(&tx, op)?;
+        tx.commit()?;
         Ok(())
     }
 }
@@ -1373,6 +1405,84 @@ impl Contact {
             raw_vcard: String::new(),
         }
     }
+}
+
+/// Put the store in WAL mode, tolerating whoever else is doing it.
+///
+/// `PRAGMA journal_mode=WAL` does **not** honour `busy_timeout`: it answers
+/// `SQLITE_BUSY` immediately instead of waiting for the exclusive lock it wants.
+/// A dozen `mb` invocations opening a fresh store therefore all attempt the
+/// switch, eleven of them get BUSY, and the store's first useful second is spent
+/// failing. Losing the race is not an error as long as the file ends up WAL, so
+/// the retry asks again and lets the winner's work stand.
+fn set_wal(db: &Connection) -> anyhow::Result<()> {
+    for _ in 0..100 {
+        let mode: String = db.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        if mode.eq_ignore_ascii_case("wal") {
+            return Ok(());
+        }
+        if db
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0))
+            .is_ok()
+        {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    bail!("could not put the store into WAL mode");
+}
+
+/// The store's device id, created exactly once even when processes race.
+///
+/// `exists()` then `write()` gives two processes that opened a fresh store two
+/// different ids: both see the file absent, both mint one, the last write wins,
+/// and the loser keeps an id the store does not record. Every op it writes then
+/// belongs to a device the store has forgotten, which is a sync failure that
+/// looks like data loss. `create_new` makes exactly one process the creator.
+fn read_or_create_device_id(path: &Path) -> anyhow::Result<String> {
+    if let Ok(text) = fs::read_to_string(path) {
+        let id = text.trim().to_string();
+        if !id.is_empty() {
+            return Ok(id);
+        }
+    }
+    let id = Uuid::new_v4().to_string();
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => {
+            writeln!(file, "{id}")?;
+            Ok(id)
+        }
+        // Someone else won the race; their id is the store's identity.
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let text = fs::read_to_string(path)?;
+            let id = text.trim().to_string();
+            if id.is_empty() {
+                bail!("device id file {} is empty", path.display());
+            }
+            Ok(id)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The next sequence number for one device's line in a book.
+///
+/// Takes the connection rather than `&self` so a caller can run it inside the
+/// `BEGIN IMMEDIATE` transaction that will use the number: reading it outside
+/// the write lock is exactly the race this exists to avoid.
+fn next_seq_on(db: &Connection, book: &str, device_id: &str) -> anyhow::Result<u64> {
+    let current: Option<i64> = db
+        .query_row(
+            "SELECT seq FROM ops WHERE book_id=?1 AND device_id=?2 ORDER BY seq DESC LIMIT 1",
+            params![book, device_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(current.unwrap_or(0) as u64 + 1)
 }
 
 fn apply_projection(db: &Connection, op: &Op) -> anyhow::Result<()> {
@@ -2405,6 +2515,174 @@ mod tests {
     use super::*;
 
     const CARD: &str = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:test-1\r\nFN:Sync Probe\r\nN:Probe;Sync;;;\r\nEMAIL;TYPE=WORK:sync-probe@example.invalid\r\nCREATED:20260102T030405Z\r\nREV:20260203T040506Z\r\nEND:VCARD\r\n";
+
+    #[test]
+    fn concurrent_opens_do_not_fail() {
+        // Short-lived processes are the normal shape for a CLI: a dozen `mb`
+        // invocations at once all open this store, and on a fresh store they all
+        // try to create the schema, switch the journal mode and mint the device
+        // id at the same time. Opening used to fail for most of them, and the
+        // ones that survived could disagree about the device id.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("store");
+        let device = dir.path().join("device");
+        let handles: Vec<_> = (0..12)
+            .map(|_| {
+                let root = root.clone();
+                let device = device.clone();
+                std::thread::spawn(move || Store::open(&root, &device))
+            })
+            .collect();
+        let mut opened = Vec::new();
+        let mut failures = Vec::new();
+        for handle in handles {
+            match handle.join().expect("open thread") {
+                Ok(store) => opened.push(store.device_id),
+                Err(error) => failures.push(error.to_string()),
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} of 12 opens failed: {failures:?}",
+            failures.len()
+        );
+        opened.sort();
+        opened.dedup();
+        assert_eq!(opened.len(), 1, "one store, one device id: {opened:?}");
+    }
+
+    #[test]
+    fn applying_the_same_op_twice_is_a_no_op() {
+        // The protocol promises "op_id makes re-delivery idempotent", and two
+        // appliers that both decide an op is new rely on it. Before this, the
+        // second insert failed on UNIQUE(book_id, device_id, seq): a harmless
+        // re-delivery reported as corruption.
+        let dir = tempfile::tempdir().unwrap();
+        let mut source = Store::open(&dir.path().join("a"), &dir.path().join("dev-a")).unwrap();
+        let op = source
+            .put_record(
+                "personal/test/book",
+                "item-1",
+                "test.item@1",
+                1,
+                serde_json::json!({"n": 1}),
+            )
+            .unwrap();
+        let mut peer = Store::open(&dir.path().join("b"), &dir.path().join("dev-b")).unwrap();
+        peer.apply_op(&op).unwrap();
+        peer.apply_op(&op).unwrap();
+        peer.apply_op(&op).unwrap();
+        assert_eq!(peer.dump("personal/test/book", None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn concurrent_appliers_do_not_fail() {
+        // Two hosts syncing one book at once both decide an op is new. One wins;
+        // the other must write nothing and report success.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("target");
+        let device = dir.path().join("dev-target");
+        let mut source =
+            Store::open(&dir.path().join("source"), &dir.path().join("dev-src")).unwrap();
+        let ops: Vec<Op> = (0..40)
+            .map(|n| {
+                source
+                    .put_record(
+                        "personal/test/book",
+                        &format!("item-{n}"),
+                        "test.item@1",
+                        1,
+                        serde_json::json!({"n": n}),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        Store::open(&root, &device).unwrap();
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let root = root.clone();
+                let device = device.clone();
+                let ops = ops.clone();
+                std::thread::spawn(move || -> anyhow::Result<()> {
+                    let mut store = Store::open(&root, &device)?;
+                    for op in &ops {
+                        store.apply_op(op)?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("applier thread").expect("apply_op");
+        }
+        let store = Store::open(&root, &device).unwrap();
+        assert_eq!(store.dump("personal/test/book", None).unwrap().len(), 40);
+    }
+
+    #[test]
+    fn concurrent_writers_get_distinct_sequences() {
+        // `MAX(seq)+1` read outside the write transaction hands two writers the
+        // same number, and the loser's write can never be applied by a peer.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("book");
+        let device = dir.path().join("dev-w");
+        Store::open(&root, &device).unwrap();
+        let handles: Vec<_> = (0..4)
+            .map(|writer| {
+                let root = root.clone();
+                let device = device.clone();
+                std::thread::spawn(move || {
+                    let mut store = Store::open(&root, &device).unwrap();
+                    for n in 0..10 {
+                        store
+                            .put_record(
+                                "personal/test/book",
+                                &format!("w{writer}-{n}"),
+                                "test.item@1",
+                                1,
+                                serde_json::json!({"n": n}),
+                            )
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("writer thread");
+        }
+        let ops = Store::open(&root, &device)
+            .unwrap()
+            .dump("personal/test/book", None)
+            .unwrap();
+        assert_eq!(ops.len(), 40);
+        let mut seqs: Vec<u64> = ops.iter().map(|op| op.seq).collect();
+        seqs.sort_unstable();
+        seqs.dedup();
+        assert_eq!(seqs.len(), 40, "every write must get its own sequence");
+    }
+
+    #[test]
+    fn a_sequence_collision_names_both_ops() {
+        // A store where one device claimed a number twice is corrupt, and
+        // silently dropping the second op would hide it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("a"), &dir.path().join("dev-a")).unwrap();
+        let first = store
+            .put_record(
+                "personal/test/book",
+                "item-1",
+                "test.item@1",
+                1,
+                serde_json::json!({"n": 1}),
+            )
+            .unwrap();
+        let mut clash = first.clone();
+        clash.body = serde_json::json!({"n": 2});
+        clash.op_id = op_id(&clash).unwrap();
+        let error = store.apply_op(&clash).unwrap_err().to_string();
+        assert!(error.contains(&first.op_id), "{error}");
+        assert!(error.contains("one number"), "{error}");
+    }
 
     #[test]
     fn imports_exports_and_round_trips_ops() {
