@@ -120,19 +120,26 @@ records --root ~/.local/share/fungos/records unibus-sync \
   --peer records.studio
 ```
 
-Protocol kinds:
+Protocol kinds (`feta.sync.*`; the older `records.sync.*` names are still read):
 
 ```text
-records.sync.pull.v1   consumer -> provider
-records.sync.ops.v1    provider -> consumer
-records.sync.push.v1   consumer -> provider
-records.sync.ack.v1    provider -> consumer
-records.sync.error.v1  provider -> consumer
+feta.sync.pull.v1      consumer -> provider
+feta.sync.ops.v1       provider -> consumer
+feta.sync.push.v1      consumer -> provider
+feta.sync.ack.v1       provider -> consumer
+feta.sync.failure.v1   provider -> consumer
 ```
 
 The provider exchanges vectors, returns ops missing from the caller, and accepts
 ops the caller has that the provider lacks. `op_id` makes re-delivery
 idempotent.
+
+A paged pull carries its resume point as opaque text — `hlc:seq:device` — rather
+than as this crate's cursor struct, so a peer can hold one without knowing the
+query behind it. Frames from a build before the move still decode, old field
+names and old cursor shape included. The reverse is not true: a build from
+before the move ignores the new kinds, which surfaces as a timeout rather than
+a half-applied book. **Upgrade both ends of a pair together.**
 
 ### SSH fallback
 
@@ -184,7 +191,7 @@ change feed including tombstones. `crates/soil-records-host` in Soil exposes thi
 
 ## Shared peer session
 
-The records sync protocol is transport-neutral. The same `records.sync.*` kinds
+The records sync protocol is transport-neutral. The same `feta.sync.*` frames
 can run over the TCP hub adapter or an already-authorized Unibus peer session:
 
 ```rust

@@ -34,11 +34,78 @@ const FEED_ITEM_VERSION: i64 = 1;
 const MAX_FEED_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_FEED_LIMIT: usize = 250;
 const FEED_TIMEOUT: Duration = Duration::from_secs(20);
-const PULL_KIND: &str = "records.sync.pull.v1";
-const OPS_KIND: &str = "records.sync.ops.v1";
-const PUSH_KIND: &str = "records.sync.push.v1";
-const ACK_KIND: &str = "records.sync.ack.v1";
-const ERROR_KIND: &str = "records.sync.error.v1";
+/// The sync frames, in the spelling the shared `feta` crate uses.
+///
+/// `records.sync.*` was the old spelling and every frame is still read under it
+/// (see [`legacy`]), so a new host can understand an old one. Emission moved in
+/// one step rather than a long dual-write, because the cursor moved with it:
+/// a paged pull cannot round-trip against a peer that reads cursors as structs.
+const PULL_KIND: &str = "feta.sync.pull.v1";
+const OPS_KIND: &str = "feta.sync.ops.v1";
+const PUSH_KIND: &str = "feta.sync.push.v1";
+const ACK_KIND: &str = "feta.sync.ack.v1";
+const ERROR_KIND: &str = "feta.sync.failure.v1";
+
+/// The same five frames as `records` named them before the move.
+mod legacy {
+    pub const PULL: &str = "records.sync.pull.v1";
+    pub const OPS: &str = "records.sync.ops.v1";
+    pub const PUSH: &str = "records.sync.push.v1";
+    pub const ACK: &str = "records.sync.ack.v1";
+    pub const ERROR: &str = "records.sync.error.v1";
+}
+
+/// One frame of a sync exchange, whichever spelling named it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Frame {
+    Pull,
+    Ops,
+    Push,
+    Ack,
+    Failure,
+}
+
+impl Frame {
+    /// The name this build emits for the frame.
+    fn name(self) -> &'static str {
+        match self {
+            Frame::Pull => PULL_KIND,
+            Frame::Ops => OPS_KIND,
+            Frame::Push => PUSH_KIND,
+            Frame::Ack => ACK_KIND,
+            Frame::Failure => ERROR_KIND,
+        }
+    }
+
+    /// The name an older build emits for it.
+    fn legacy(self) -> &'static str {
+        match self {
+            Frame::Pull => legacy::PULL,
+            Frame::Ops => legacy::OPS,
+            Frame::Push => legacy::PUSH,
+            Frame::Ack => legacy::ACK,
+            Frame::Failure => legacy::ERROR,
+        }
+    }
+
+    /// Whether `kind` names this frame, in either spelling.
+    fn is(self, kind: &str) -> bool {
+        kind == self.name() || kind == self.legacy()
+    }
+}
+
+/// Which frame a kind string names, in either spelling.
+fn frame_of(kind: &str) -> Option<Frame> {
+    [
+        Frame::Pull,
+        Frame::Ops,
+        Frame::Push,
+        Frame::Ack,
+        Frame::Failure,
+    ]
+    .into_iter()
+    .find(|frame| frame.is(kind))
+}
 const SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 /// How much of a book one sync frame may carry.
 ///
@@ -306,6 +373,7 @@ pub fn run_cli() -> anyhow::Result<()> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Vector {
+    #[serde(rename = "book", alias = "book_id")]
     pub book_id: String,
     pub devices: BTreeMap<String, u64>,
 }
@@ -2087,54 +2155,149 @@ pub struct PeerSyncOutcome {
 }
 
 /// Where a page stopped, so the next pull resumes after it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Internal: frames carry [`WireCursor`], because a shared protocol cannot name
+/// this crate's struct.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpCursor {
     hlc: u64,
     device_id: String,
     seq: u64,
 }
 
+impl OpCursor {
+    /// This cursor as a frame carries it.
+    ///
+    /// Flattened to text so any peer can hold it without knowing the resume
+    /// query. Device last: a device id may contain the separator, the numbers
+    /// may not.
+    fn to_wire(&self) -> String {
+        format!("{}:{}:{}", self.hlc, self.seq, self.device_id)
+    }
+
+    fn from_wire(text: &str) -> anyhow::Result<Self> {
+        let mut parts = text.splitn(3, ':');
+        let hlc = parts
+            .next()
+            .and_then(|part| part.parse().ok())
+            .ok_or_else(|| anyhow!("cursor {text:?} has no hlc"))?;
+        let seq = parts
+            .next()
+            .and_then(|part| part.parse().ok())
+            .ok_or_else(|| anyhow!("cursor {text:?} has no seq"))?;
+        let device_id = parts
+            .next()
+            .ok_or_else(|| anyhow!("cursor {text:?} has no device"))?;
+        Ok(Self {
+            hlc,
+            device_id: device_id.to_string(),
+            seq,
+        })
+    }
+}
+
+/// A cursor as a sync frame carries it.
+///
+/// New frames carry the text form. Frames from a build before the move carry
+/// the struct, and both are read, so a host can finish an exchange with a peer
+/// that has not been upgraded yet.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum WireCursor {
+    Text(String),
+    Legacy {
+        hlc: u64,
+        device_id: String,
+        seq: u64,
+    },
+}
+
+impl WireCursor {
+    fn text(cursor: &OpCursor) -> Self {
+        WireCursor::Text(cursor.to_wire())
+    }
+
+    fn decode(&self) -> anyhow::Result<OpCursor> {
+        match self {
+            WireCursor::Text(text) => OpCursor::from_wire(text),
+            WireCursor::Legacy {
+                hlc,
+                device_id,
+                seq,
+            } => Ok(OpCursor {
+                hlc: *hlc,
+                device_id: device_id.clone(),
+                seq: *seq,
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PullRequest {
+    #[serde(rename = "request", alias = "request_id")]
     request_id: String,
+    #[serde(rename = "book", alias = "book_id")]
     book_id: String,
     vector: Vector,
     /// Resume after this op. Absent starts from the beginning of the log.
     #[serde(default)]
-    after: Option<OpCursor>,
+    after: Option<WireCursor>,
+}
+
+impl PullRequest {
+    /// The cursor to resume from, in this crate's form.
+    fn resume_after(&self) -> anyhow::Result<Option<OpCursor>> {
+        self.after.as_ref().map(WireCursor::decode).transpose()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OpsResponse {
+    #[serde(rename = "request", alias = "request_id")]
     request_id: String,
+    #[serde(rename = "book", alias = "book_id")]
     book_id: String,
     ops: Vec<Op>,
     vector: Vector,
     /// Resume point for the page after this one.
     #[serde(default)]
-    cursor: Option<OpCursor>,
+    cursor: Option<WireCursor>,
     /// Ops remain beyond this page.
     #[serde(default)]
     more: bool,
 }
 
+impl OpsResponse {
+    /// The cursor to resume from, in this crate's form.
+    fn resume_after(&self) -> anyhow::Result<Option<OpCursor>> {
+        self.cursor.as_ref().map(WireCursor::decode).transpose()
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PushRequest {
+    #[serde(rename = "request", alias = "request_id")]
     request_id: String,
+    #[serde(rename = "book", alias = "book_id")]
     book_id: String,
     ops: Vec<Op>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AckResponse {
+    #[serde(rename = "request", alias = "request_id")]
     request_id: String,
+    #[serde(rename = "book", alias = "book_id")]
     book_id: String,
     applied: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SyncError {
+    #[serde(rename = "request", alias = "request_id")]
     request_id: String,
+    #[serde(rename = "book", alias = "book_id")]
     book_id: String,
     code: String,
     detail: String,
@@ -2164,27 +2327,29 @@ fn serve_unibus(store: &mut Store, config: &Path) -> anyhow::Result<()> {
         if !payload.is_empty() {
             continue;
         }
-        match envelope.message.kind.as_str() {
-            PULL_KIND => {
+        match frame_of(&envelope.message.kind) {
+            Some(Frame::Pull) => {
                 let Ok(request) =
                     serde_json::from_value::<PullRequest>(envelope.message.body.clone().into())
                 else {
                     eprintln!("records: invalid pull request");
                     continue;
                 };
-                match store.dump_page(
-                    &request.book_id,
-                    Some(&request.vector),
-                    request.after.as_ref(),
-                    SYNC_PAGE_BYTES,
-                ) {
+                match request.resume_after().and_then(|after| {
+                    store.dump_page(
+                        &request.book_id,
+                        Some(&request.vector),
+                        after.as_ref(),
+                        SYNC_PAGE_BYTES,
+                    )
+                }) {
                     Ok((ops, cursor, more)) => {
                         let response = OpsResponse {
                             request_id: request.request_id.clone(),
                             book_id: request.book_id.clone(),
                             vector: store.vector(&request.book_id)?,
                             ops,
-                            cursor,
+                            cursor: cursor.as_ref().map(WireCursor::text),
                             more,
                         };
                         reply(&client, &envelope, OPS_KIND, &response)?;
@@ -2199,7 +2364,7 @@ fn serve_unibus(store: &mut Store, config: &Path) -> anyhow::Result<()> {
                     )?,
                 }
             }
-            PUSH_KIND => {
+            Some(Frame::Push) => {
                 let Ok(request) =
                     serde_json::from_value::<PushRequest>(envelope.message.body.clone().into())
                 else {
@@ -2235,7 +2400,7 @@ fn serve_unibus(store: &mut Store, config: &Path) -> anyhow::Result<()> {
                     reply(&client, &envelope, ACK_KIND, &response)?;
                 }
             }
-            ERROR_KIND => {}
+            Some(Frame::Failure) => {}
             _ => {}
         }
     }
@@ -2288,13 +2453,14 @@ fn sync_unibus(store: &mut Store, book: &str, config: &Path, peer: &str) -> anyh
             request_id: request_id.clone(),
             book_id: book.into(),
             vector: store.vector(book)?,
-            after: after.clone(),
+            after: after.as_ref().map(WireCursor::text),
         };
         send_request(&client, peer, PULL_KIND, &pull)?;
-        let response: OpsResponse = wait_for(&client, OPS_KIND, &request_id)?;
+        let response: OpsResponse = wait_for(&client, Frame::Ops, &request_id)?;
         if response.book_id != book {
             bail!("peer answered for {}", response.book_id);
         }
+        let resume = response.resume_after()?;
         remote = response.vector;
         for op in &response.ops {
             store.apply_op(op)?;
@@ -2303,7 +2469,7 @@ fn sync_unibus(store: &mut Store, book: &str, config: &Path, peer: &str) -> anyh
         if !response.more {
             break;
         }
-        match response.cursor {
+        match resume {
             Some(cursor) => after = Some(cursor),
             None => break,
         }
@@ -2318,7 +2484,7 @@ fn sync_unibus(store: &mut Store, book: &str, config: &Path, peer: &str) -> anyh
             ops: chunk.to_vec(),
         };
         send_request(&client, peer, PUSH_KIND, &push)?;
-        let ack: AckResponse = wait_for(&client, ACK_KIND, &request_id)?;
+        let ack: AckResponse = wait_for(&client, Frame::Ack, &request_id)?;
         if ack.book_id != book {
             bail!("peer acknowledged {}", ack.book_id);
         }
@@ -2332,7 +2498,7 @@ fn sync_unibus(store: &mut Store, book: &str, config: &Path, peer: &str) -> anyh
     Ok(())
 }
 
-/// Serve `records.sync.*` frames on one already-authorized shared peer session.
+/// Serve sync frames on one already-authorized shared peer session.
 ///
 /// This is transport-neutral: the same function can run over a Unibus TCP hub
 /// adapter, an Iroh `unibus/peer/1` session, or a test session. The session
@@ -2355,10 +2521,7 @@ pub async fn serve_peer_session(
 /// to the records sync protocol. A shared host router can call this alongside
 /// Geode and other application handlers.
 pub fn is_sync_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        PULL_KIND | OPS_KIND | PUSH_KIND | ACK_KIND | ERROR_KIND
-    )
+    frame_of(kind).is_some()
 }
 
 pub async fn handle_peer_frame(
@@ -2372,25 +2535,27 @@ pub async fn handle_peer_frame(
         return Ok(false);
     }
     {
-        match envelope.message.kind.as_str() {
-            PULL_KIND => {
+        match frame_of(&envelope.message.kind) {
+            Some(Frame::Pull) => {
                 let Ok(request) =
                     serde_json::from_value::<PullRequest>(envelope.message.body.clone().into())
                 else {
                     return Ok(true);
                 };
-                let response = match store.dump_page(
-                    &request.book_id,
-                    Some(&request.vector),
-                    request.after.as_ref(),
-                    SYNC_PAGE_BYTES,
-                ) {
+                let response = match request.resume_after().and_then(|after| {
+                    store.dump_page(
+                        &request.book_id,
+                        Some(&request.vector),
+                        after.as_ref(),
+                        SYNC_PAGE_BYTES,
+                    )
+                }) {
                     Ok((ops, cursor, more)) => OpsResponse {
                         request_id: request.request_id.clone(),
                         book_id: request.book_id.clone(),
                         vector: store.vector(&request.book_id)?,
                         ops,
-                        cursor,
+                        cursor: cursor.as_ref().map(WireCursor::text),
                         more,
                     },
                     Err(error) => {
@@ -2409,7 +2574,7 @@ pub async fn handle_peer_frame(
                 };
                 reply_peer(session, endpoint, &envelope, OPS_KIND, &response).await?;
             }
-            PUSH_KIND => {
+            Some(Frame::Push) => {
                 let Ok(request) =
                     serde_json::from_value::<PushRequest>(envelope.message.body.clone().into())
                 else {
@@ -2477,13 +2642,14 @@ pub async fn sync_peer_session(
             request_id: request_id.clone(),
             book_id: book.into(),
             vector: store.vector(book)?,
-            after: after.clone(),
+            after: after.as_ref().map(WireCursor::text),
         };
         send_peer(session, endpoint, PULL_KIND, &pull).await?;
-        let response: OpsResponse = wait_peer(session, OPS_KIND, &request_id).await?;
+        let response: OpsResponse = wait_peer(session, Frame::Ops, &request_id).await?;
         if response.book_id != book {
             bail!("peer answered for {}", response.book_id);
         }
+        let resume = response.resume_after()?;
         remote = response.vector;
         for op in &response.ops {
             store.apply_op(op)?;
@@ -2492,7 +2658,7 @@ pub async fn sync_peer_session(
         if !response.more {
             break;
         }
-        match response.cursor {
+        match resume {
             Some(cursor) => after = Some(cursor),
             // "More" with no cursor cannot advance; stop rather than spin.
             None => break,
@@ -2515,7 +2681,7 @@ pub async fn sync_peer_session(
             },
         )
         .await?;
-        let ack: AckResponse = wait_peer(session, ACK_KIND, &request_id).await?;
+        let ack: AckResponse = wait_peer(session, Frame::Ack, &request_id).await?;
         if ack.book_id != book {
             bail!("peer acknowledged {}", ack.book_id);
         }
@@ -2610,7 +2776,7 @@ async fn reply_peer_error(
 
 async fn wait_peer<T: for<'de> Deserialize<'de>>(
     session: &mut dyn PeerSession,
-    kind: &str,
+    frame: Frame,
     request_id: &str,
 ) -> anyhow::Result<T> {
     loop {
@@ -2621,7 +2787,7 @@ async fn wait_peer<T: for<'de> Deserialize<'de>>(
         if !payload.is_empty() {
             continue;
         }
-        if envelope.message.kind == ERROR_KIND {
+        if Frame::Failure.is(&envelope.message.kind) {
             let error: SyncError =
                 serde_json::from_value(envelope.message.body.into()).context("parse peer error")?;
             if error.request_id == request_id {
@@ -2629,19 +2795,26 @@ async fn wait_peer<T: for<'de> Deserialize<'de>>(
             }
             continue;
         }
-        if envelope.message.kind != kind {
+        if !frame.is(&envelope.message.kind) {
             continue;
         }
         let body: serde_json::Value = envelope.message.body.into();
-        let response_request = body
-            .get("request_id")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default();
-        if response_request != request_id {
+        if request_id_of(&body) != request_id {
             continue;
         }
         return serde_json::from_value(body).context("decode peer response");
     }
+}
+
+/// The request a reply body answers.
+///
+/// New frames name it `request`; frames from an older build named it
+/// `request_id`. Both are read while a fleet is mid-upgrade.
+fn request_id_of(body: &serde_json::Value) -> &str {
+    body.get("request_id")
+        .or_else(|| body.get("request"))
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
 }
 
 fn send_request<T: Serialize>(
@@ -2658,13 +2831,13 @@ fn send_request<T: Serialize>(
 
 fn wait_for<T: for<'de> Deserialize<'de>>(
     client: &Client,
-    kind: &str,
+    frame: Frame,
     request_id: &str,
 ) -> anyhow::Result<T> {
     let deadline = Instant::now() + SYNC_TIMEOUT;
     loop {
         if Instant::now() >= deadline {
-            bail!("timed out waiting for {kind}");
+            bail!("timed out waiting for {}", frame.name());
         }
         let Some((envelope, payload)) = client
             .try_read()
@@ -2676,7 +2849,7 @@ fn wait_for<T: for<'de> Deserialize<'de>>(
         if !payload.is_empty() {
             continue;
         }
-        if envelope.message.kind == ERROR_KIND {
+        if Frame::Failure.is(&envelope.message.kind) {
             let error: SyncError =
                 serde_json::from_value(envelope.message.body.into()).context("parse sync error")?;
             if error.request_id == request_id {
@@ -2684,15 +2857,11 @@ fn wait_for<T: for<'de> Deserialize<'de>>(
             }
             continue;
         }
-        if envelope.message.kind != kind {
+        if !frame.is(&envelope.message.kind) {
             continue;
         }
         let body: serde_json::Value = envelope.message.body.into();
-        let response_request = body
-            .get("request_id")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default();
-        if response_request != request_id {
+        if request_id_of(&body) != request_id {
             continue;
         }
         return serde_json::from_value(body).context("decode Unibus response");
@@ -2702,6 +2871,141 @@ fn wait_for<T: for<'de> Deserialize<'de>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::mpsc;
+    use unibus::PeerFuture;
+
+    /// Two sessions wired to each other, so a test can run a real exchange.
+    struct TestSession {
+        peer: String,
+        outgoing: mpsc::UnboundedSender<(Envelope, Vec<u8>)>,
+        incoming: mpsc::UnboundedReceiver<(Envelope, Vec<u8>)>,
+    }
+
+    impl PeerSession for TestSession {
+        fn peer_id(&self) -> &str {
+            &self.peer
+        }
+
+        fn send<'a>(&'a mut self, envelope: &'a Envelope, payload: &'a [u8]) -> PeerFuture<'a, ()> {
+            Box::pin(async move {
+                self.outgoing
+                    .send((envelope.clone(), payload.to_vec()))
+                    .map_err(|error| unibus::PeerError(error.to_string()))
+            })
+        }
+
+        fn receive(&mut self) -> PeerFuture<'_, (Envelope, Vec<u8>)> {
+            Box::pin(async move {
+                self.incoming
+                    .recv()
+                    .await
+                    .ok_or_else(|| unibus::PeerError("closed".into()))
+            })
+        }
+    }
+
+    fn session_pair(left: &str, right: &str) -> (TestSession, TestSession) {
+        let (left_tx, left_rx) = mpsc::unbounded_channel();
+        let (right_tx, right_rx) = mpsc::unbounded_channel();
+        (
+            TestSession {
+                peer: right.into(),
+                outgoing: right_tx,
+                incoming: left_rx,
+            },
+            TestSession {
+                peer: left.into(),
+                outgoing: left_tx,
+                incoming: right_rx,
+            },
+        )
+    }
+
+    #[test]
+    fn both_spellings_name_the_same_frames() {
+        let pairs = [
+            (Frame::Pull, "feta.sync.pull.v1", "records.sync.pull.v1"),
+            (Frame::Ops, "feta.sync.ops.v1", "records.sync.ops.v1"),
+            (Frame::Push, "feta.sync.push.v1", "records.sync.push.v1"),
+            (Frame::Ack, "feta.sync.ack.v1", "records.sync.ack.v1"),
+            (
+                Frame::Failure,
+                "feta.sync.failure.v1",
+                "records.sync.error.v1",
+            ),
+        ];
+        for (frame, name, legacy) in pairs {
+            assert_eq!(frame.name(), name);
+            assert_eq!(frame_of(name), Some(frame));
+            assert_eq!(
+                frame_of(legacy),
+                Some(frame),
+                "{legacy} names the same frame"
+            );
+            assert!(is_sync_kind(name) && is_sync_kind(legacy));
+        }
+        assert_eq!(frame_of("geode.sync.pull.v1"), None);
+        assert!(!is_sync_kind("geode.sync.pull.v1"));
+    }
+
+    #[test]
+    fn a_cursor_round_trips_through_its_text_form() {
+        let cursor = OpCursor {
+            hlc: 1_700_000_000_000,
+            // A separator inside the device proves the split is device-last.
+            device_id: "records:studio".into(),
+            seq: 42,
+        };
+        let text = cursor.to_wire();
+        assert_eq!(text, "1700000000000:42:records:studio");
+        assert_eq!(OpCursor::from_wire(&text).unwrap(), cursor);
+        assert!(OpCursor::from_wire("").is_err());
+        assert!(OpCursor::from_wire("1:2").is_err());
+    }
+
+    #[test]
+    fn frames_from_an_older_build_still_decode() {
+        // Before the move the fields were `request_id`/`book_id` and the cursor
+        // was a struct.
+        let pull: PullRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "r-1",
+            "book_id": "test/contacts",
+            "vector": {"book_id": "test/contacts", "devices": {"studio": 7}},
+            "after": {"hlc": 12, "device_id": "studio", "seq": 7},
+        }))
+        .unwrap();
+        assert_eq!(pull.request_id, "r-1");
+        assert_eq!(pull.vector.book_id, "test/contacts");
+        assert_eq!(
+            pull.resume_after().unwrap(),
+            Some(OpCursor {
+                hlc: 12,
+                device_id: "studio".into(),
+                seq: 7,
+            })
+        );
+
+        // What this build emits names them the other way, cursor as text.
+        let emitted = serde_json::to_value(PullRequest {
+            request_id: "r-2".into(),
+            book_id: "test/contacts".into(),
+            vector: Vector {
+                book_id: "test/contacts".into(),
+                devices: BTreeMap::new(),
+            },
+            after: Some(WireCursor::text(&OpCursor {
+                hlc: 3,
+                device_id: "neo".into(),
+                seq: 1,
+            })),
+        })
+        .unwrap();
+        assert_eq!(emitted["request"], "r-2");
+        assert_eq!(emitted["book"], "test/contacts");
+        assert_eq!(emitted["after"], "3:1:neo");
+        assert!(emitted.get("request_id").is_none());
+        assert!(emitted.get("book_id").is_none());
+    }
 
     const CARD: &str = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:test-1\r\nFN:Sync Probe\r\nN:Probe;Sync;;;\r\nEMAIL;TYPE=WORK:sync-probe@example.invalid\r\nCREATED:20260102T030405Z\r\nREV:20260203T040506Z\r\nEND:VCARD\r\n";
 
@@ -3268,59 +3572,6 @@ mod tests {
 
     #[tokio::test]
     async fn shared_peer_session_syncs_records() {
-        use tokio::sync::mpsc;
-        use unibus::PeerFuture;
-
-        struct TestSession {
-            peer: String,
-            outgoing: mpsc::UnboundedSender<(Envelope, Vec<u8>)>,
-            incoming: mpsc::UnboundedReceiver<(Envelope, Vec<u8>)>,
-        }
-
-        impl PeerSession for TestSession {
-            fn peer_id(&self) -> &str {
-                &self.peer
-            }
-
-            fn send<'a>(
-                &'a mut self,
-                envelope: &'a Envelope,
-                payload: &'a [u8],
-            ) -> PeerFuture<'a, ()> {
-                Box::pin(async move {
-                    self.outgoing
-                        .send((envelope.clone(), payload.to_vec()))
-                        .map_err(|error| unibus::PeerError(error.to_string()))
-                })
-            }
-
-            fn receive(&mut self) -> PeerFuture<'_, (Envelope, Vec<u8>)> {
-                Box::pin(async move {
-                    self.incoming
-                        .recv()
-                        .await
-                        .ok_or_else(|| unibus::PeerError("closed".into()))
-                })
-            }
-        }
-
-        fn pair(left: &str, right: &str) -> (TestSession, TestSession) {
-            let (left_tx, left_rx) = mpsc::unbounded_channel();
-            let (right_tx, right_rx) = mpsc::unbounded_channel();
-            (
-                TestSession {
-                    peer: right.into(),
-                    outgoing: right_tx,
-                    incoming: left_rx,
-                },
-                TestSession {
-                    peer: left.into(),
-                    outgoing: left_tx,
-                    incoming: right_rx,
-                },
-            )
-        }
-
         let dir = tempfile::tempdir().unwrap();
         let mut server = Store::open(
             &dir.path().join("studio"),
@@ -3339,7 +3590,8 @@ mod tests {
             )
             .unwrap();
 
-        let (mut client_session, mut server_session) = pair("records.macbook", "records.studio");
+        let (mut client_session, mut server_session) =
+            session_pair("records.macbook", "records.studio");
         let server_endpoint = PeerEndpoint {
             installation_id: "home".into(),
             producer_id: "records.studio".into(),
@@ -3362,6 +3614,65 @@ mod tests {
         assert_eq!(outcome.pulled, 1);
         assert_eq!(outcome.pushed, 0);
         assert_eq!(client.list("test/contacts", None, 10).unwrap().len(), 1);
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_book_larger_than_one_frame_pages_over_a_peer_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = Store::open(
+            &dir.path().join("studio"),
+            &dir.path().join("studio-device"),
+        )
+        .unwrap();
+        let mut client =
+            Store::open(&dir.path().join("neo"), &dir.path().join("neo-device")).unwrap();
+
+        // Bodies this size put 400 records well past the 256 KiB page, so the
+        // pull cannot finish in one frame: the cursor has to survive the wire.
+        assert!(
+            400 * 1024 > SYNC_PAGE_BYTES,
+            "premise: the test book is larger than one page"
+        );
+        let body = "x".repeat(1024);
+        for index in 0..400 {
+            server
+                .put_record(
+                    "test/notes",
+                    &format!("note-{index:03}"),
+                    "fungos.notes/note",
+                    1,
+                    serde_json::json!({ "body": body }),
+                )
+                .unwrap();
+        }
+
+        let (mut client_session, mut server_session) =
+            session_pair("records.macbook", "records.studio");
+        let server_endpoint = PeerEndpoint {
+            installation_id: "home".into(),
+            producer_id: "records.studio".into(),
+        };
+        let client_endpoint = PeerEndpoint {
+            installation_id: "home".into(),
+            producer_id: "records.macbook".into(),
+        };
+        let server_task = tokio::spawn(async move {
+            let _ = serve_peer_session(&mut server_session, &mut server, &server_endpoint).await;
+        });
+        let outcome = sync_peer_session(
+            &mut client_session,
+            &mut client,
+            "test/notes",
+            &client_endpoint,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome.pulled, 400,
+            "every op crossed, not just the first page"
+        );
+        assert_eq!(client.list("test/notes", None, 500).unwrap().len(), 400);
         server_task.abort();
     }
 
