@@ -1,3 +1,6 @@
+[workspace]
+members = ["agents-event"]
+
 [package]
 name = "fungos-records"
 version = "0.1.0"
@@ -23,10 +26,6 @@ toml = "0.8"
 ureq = "2"
 uuid = { version = "1", features = ["v4"] }
 unibus = { git = "https://github.com/mycelium-linux/unibus.git", rev = "8bf8f79" }
-
-# Its own workspace: a single-package repo, so that an unrelated manifest
-# somewhere above the checkout cannot capture it.
-[workspace]
 
 [[bin]]
 name = "records"

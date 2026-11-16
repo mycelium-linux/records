@@ -1177,6 +1177,19 @@ impl Store {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Every book this store holds, sorted.
+    ///
+    /// A book is a namespace, not a table, so there is no registry to read:
+    /// the op log is the list. A caller that wants one kind of book filters by
+    /// prefix (a transcript reader takes `fungos/agents/`).
+    pub fn books(&self) -> anyhow::Result<Vec<String>> {
+        let mut statement = self
+            .db
+            .prepare("SELECT DISTINCT book_id FROM ops ORDER BY book_id")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn list(
         &self,
         book: &str,
@@ -3396,6 +3409,30 @@ mod tests {
             count += 1;
         }
         count
+    }
+
+    #[test]
+    fn the_store_names_the_books_it_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path(), &dir.path().join("device")).unwrap();
+        store.append("test/agents/a", "evt:1", "record.put", event("hi")).unwrap();
+        store.append("test/agents/b", "evt:1", "record.put", event("hi")).unwrap();
+        store.append("test/contacts", "ada", "record.put", event("hi")).unwrap();
+
+        assert_eq!(
+            store.books().unwrap(),
+            ["test/agents/a", "test/agents/b", "test/contacts"],
+            "every book, sorted, from the log itself"
+        );
+        assert_eq!(
+            store
+                .books()
+                .unwrap()
+                .into_iter()
+                .filter(|book| book.starts_with("test/agents/"))
+                .count(),
+            2
+        );
     }
 
     #[test]
