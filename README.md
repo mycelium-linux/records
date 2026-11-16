@@ -16,7 +16,7 @@ encryption model.
 - vCard export
 - iCalendar import/export for events, with raw VEVENT/VTIMEZONE preservation
 - RSS/Atom ingest into searchable records from a host-side feed list
-- list/search/stat/vector/dump/apply
+- list/search/stat/vector/dump/apply/append
 - generic schema-tagged entries plus the built-in contacts schema
 - materialized changes and revision/origin merge
 - Unibus device sync with a long-running provider
@@ -101,6 +101,23 @@ records --root ~/.local/share/fungos/records list \
 records --root ~/.local/share/fungos/records list \
   --book personal/avery/contacts --search acme --json
 ```
+
+## Append, for a producer
+
+A running producer — an agent adapter, a sync bridge — appends through the store
+instead of writing SQLite, so the store keeps the sequence, the HLC and the op
+id:
+
+```sh
+printf '%s\n' \
+  '{"entity_id":"msg:1","kind":"record.put","body":{"schema_id":"fungos.agents/event","schema_version":1,"fields":{"text":"hi"}}}' \
+  | records --root ~/.local/share/fungos/records append --book fungos/agents/t1
+```
+
+One process per book, one JSON line per op: an append costs a transaction, not a
+process spawn. An append that repeats the newest op for an entity writes
+nothing, so a producer may re-stream what it already wrote without doubling the
+book. `--json` prints each op as it lands.
 
 ## Unibus sync
 

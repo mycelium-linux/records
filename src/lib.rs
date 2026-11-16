@@ -128,6 +128,18 @@ enum Cmd {
         #[arg(long)]
         book: String,
     },
+    /// Append the entries a producer emits, one JSON object per line on stdin.
+    ///
+    /// Each line is `{"entity_id": ..., "kind": ..., "body": ...}`; the store
+    /// assigns `seq`, the HLC and the op id, and repeats of the newest op for an
+    /// entity are skipped, so a producer may re-stream what it already wrote.
+    Append {
+        #[arg(long)]
+        book: String,
+        /// Print each op as it is appended, one JSON object per line.
+        #[arg(long)]
+        json: bool,
+    },
     Sync {
         #[arg(long)]
         book: String,
@@ -270,6 +282,9 @@ pub fn run_cli() -> anyhow::Result<()> {
             }
             println!("applied {count} ops");
         }
+        Cmd::Append { book, json } => {
+            append_stream(&mut store, &book, json)?;
+        }
         Cmd::Sync {
             book,
             ssh,
@@ -300,6 +315,48 @@ pub fn run_cli() -> anyhow::Result<()> {
         Cmd::UnibusSync { book, config, peer } => {
             sync_unibus(&mut store, &book, &config, &peer)?;
         }
+    }
+    Ok(())
+}
+
+/// One entry from the producer-facing append stream.
+#[derive(Debug, Deserialize)]
+struct AppendEntry {
+    entity_id: String,
+    kind: String,
+    #[serde(default)]
+    body: serde_json::Value,
+}
+
+/// Append newline-delimited entries read from stdin.
+///
+/// One process per book rather than one per op: a producer streaming a harness
+/// emits thousands of entries, and an append should cost a transaction, not a
+/// process spawn. A bad line names itself and stops the stream, because a
+/// producer that silently loses an entry writes a transcript with a hole in it.
+fn append_stream(store: &mut Store, book: &str, json: bool) -> anyhow::Result<()> {
+    let stdin = io::stdin();
+    let mut count = 0usize;
+    for (index, line) in stdin.lock().lines().enumerate() {
+        let line = line?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let entry: AppendEntry = serde_json::from_str(line)
+            .with_context(|| format!("parse entry on line {}", index + 1))?;
+        if entry.entity_id.trim().is_empty() {
+            bail!("entry on line {} has no entity id", index + 1);
+        }
+        let op = store.append(book, &entry.entity_id, &entry.kind, entry.body)?;
+        count += 1;
+        if json {
+            println!("{}", serde_json::to_string(&op)?);
+            io::stdout().flush()?;
+        }
+    }
+    if !json {
+        println!("appended {count} entries to {book}");
     }
     Ok(())
 }
@@ -748,6 +805,13 @@ impl Store {
         next_seq_on(&self.db, book, device_id)
     }
 
+    /// Append one op for `entity_id`.
+    ///
+    /// Re-delivery is a no-op: an append that repeats the newest op for this
+    /// entity on this device writes nothing and returns the op that already
+    /// says it. Producers stream a harness that re-sends an item whenever it
+    /// changes, so "the same fact again" is the common case, not the odd one —
+    /// without this, every restart of a producer doubles its book.
     pub fn append(
         &mut self,
         book: &str,
@@ -756,7 +820,32 @@ impl Store {
         body: serde_json::Value,
     ) -> anyhow::Result<Op> {
         let device_id = self.device_id.clone();
+        if let Some(existing) = self.latest_op(book, entity_id, &device_id)?
+            && existing.kind == kind
+            && existing.body == body
+        {
+            return Ok(existing);
+        }
         self.append_as(book, &device_id, entity_id, kind, body, now_ms())
+    }
+
+    /// The newest op this device wrote for one entity, if any.
+    fn latest_op(
+        &self,
+        book: &str,
+        entity_id: &str,
+        device_id: &str,
+    ) -> anyhow::Result<Option<Op>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT op_id,book_id,device_id,seq,hlc,kind,entity_id,body FROM ops
+                 WHERE book_id=?1 AND entity_id=?2 AND device_id=?3
+                 ORDER BY seq DESC LIMIT 1",
+                params![book, entity_id, device_id],
+                row_to_op,
+            )
+            .optional()?)
     }
 
     /// Create or replace a generic schema-tagged record.
@@ -3224,6 +3313,89 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn re_appending_the_same_fact_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path(), &dir.path().join("device")).unwrap();
+        let book = "test/agents";
+        let body = event("hello");
+
+        let first = store
+            .append(book, "msg:1", "record.put", body.clone())
+            .unwrap();
+        let repeat = store
+            .append(book, "msg:1", "record.put", body.clone())
+            .unwrap();
+        assert_eq!(
+            repeat.op_id, first.op_id,
+            "the repeat returns the op that already says it"
+        );
+        assert_eq!(store.dump(book, None).unwrap().len(), 1, "no second op");
+
+        // A growth is a real change, so it lands as its own op and wins the
+        // materialized record.
+        let grown = store
+            .append(book, "msg:1", "record.put", event("hello there"))
+            .unwrap();
+        assert_eq!(grown.seq, first.seq + 1);
+        let ops = store.dump(book, None).unwrap();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[1].body["fields"]["text"], "hello there");
+        assert_eq!(
+            store.get(book, "msg:1").unwrap().fields["text"],
+            "hello there"
+        );
+    }
+
+    #[test]
+    fn appending_a_stream_keeps_the_producers_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path(), &dir.path().join("device")).unwrap();
+        let ops = append_lines(
+            &mut store,
+            "test/agents",
+            r#"
+{"entity_id":"msg:1","kind":"record.put","body":{"schema_id":"test/event","schema_version":1,"fields":{"after":null,"text":"first"}}}
+{"entity_id":"msg:2","kind":"record.put","body":{"schema_id":"test/event","schema_version":1,"fields":{"after":"msg:1","text":"second"}}}
+
+{"entity_id":"msg:1","kind":"record.put","body":{"schema_id":"test/event","schema_version":1,"fields":{"after":null,"text":"first"}}}
+"#,
+        );
+        assert_eq!(
+            ops, 3,
+            "every line is read; the repeated one writes nothing"
+        );
+        let dumped = store.dump("test/agents", None).unwrap();
+        assert_eq!(dumped.len(), 2);
+        assert_eq!(dumped[0].entity_id, "msg:1");
+        assert_eq!(dumped[1].entity_id, "msg:2");
+        assert_eq!(dumped[1].body["fields"]["after"], "msg:1");
+    }
+
+    fn event(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "schema_id": "test/event",
+            "schema_version": 1,
+            "fields": {"text": text},
+        })
+    }
+
+    fn append_lines(store: &mut Store, book: &str, input: &str) -> usize {
+        let mut count = 0;
+        for line in input.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let entry: AppendEntry = serde_json::from_str(line).unwrap();
+            store
+                .append(book, &entry.entity_id, &entry.kind, entry.body)
+                .unwrap();
+            count += 1;
+        }
+        count
     }
 
     #[test]

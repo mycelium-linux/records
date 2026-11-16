@@ -26,7 +26,10 @@ book               <- ownership and future encryption boundary
 ```
 
 `op_id` is a BLAKE3 digest of the envelope and body. `(book_id, device_id, seq)`
-is unique. Re-delivery is a no-op.
+is unique. Re-delivery is a no-op — including locally: `append` compares against
+the newest op for the entity on the same device, so a producer that restates
+what it already wrote adds nothing. That is what lets an adapter re-attach to a
+streaming harness and still hold one copy of the transcript.
 
 ## Sync
 
