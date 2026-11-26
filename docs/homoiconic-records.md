@@ -99,3 +99,14 @@ included.
    or a projection table; do not make the form codec an evaluator.
 4. No vectors/maps until `soil-lang::Value` has them; do not invent a body shape
    no native reader can produce.
+
+## Test receipt
+
+Remote Linux build/test (Bob, Agora One), revision `69d0099`:
+
+```text
+cargo test -p fungos-records form::tests
+running 4 tests ... 4 passed; 0 failed
+cargo test -p fungos-records
+23 passed; 0 failed
+```
