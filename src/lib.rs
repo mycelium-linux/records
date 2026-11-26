@@ -28,6 +28,7 @@ use uuid::Uuid;
 pub const CONTACT_SCHEMA: &str = "fungos.contacts/contact";
 pub const CALENDAR_SCHEMA: &str = "fungos.calendar/event";
 pub const FEED_ITEM_SCHEMA: &str = "fungos.feeds/item";
+pub mod form;
 const CONTACT_VERSION: i64 = 1;
 const CALENDAR_VERSION: i64 = 1;
 const FEED_ITEM_VERSION: i64 = 1;
